@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pulse</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0a0f;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  #game-title {
+    color: #e8e8f0;
+    font-size: 13px;
+    letter-spacing: 0.35em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    opacity: 0.4;
+    font-weight: 400;
+  }
+
+  #canvas-wrapper {
+    position: relative;
+    border: 2px solid #2a2a3a;
+    transition: border-color 0.05s;
+  }
+
+  #canvas-wrapper.flash-miss {
+    border-color: #ff3344;
+    box-shadow: 0 0 30px rgba(255, 51, 68, 0.5), inset 0 0 30px rgba(255, 51, 68, 0.08);
+  }
+
+  #canvas-wrapper.flash-hit {
+    border-color: #ffffff;
+    box-shadow: 0 0 20px rgba(255, 255, 255, 0.3);
+  }
+
+  canvas {
+    display: block;
+    cursor: crosshair;
+  }
+
+  #speed-indicator {
+    color: #e8e8f0;
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-top: 10px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    height: 16px;
+  }
+
+  #speed-indicator.visible {
+    opacity: 0.35;
+  }
+</style>
+</head>
+<body>
+
+<div id="game-title">Pulse</div>
+<div id="canvas-wrapper">
+  <canvas id="gameCanvas" width="600" height="500"></canvas>
+</div>
+<div id="speed-indicator" id="speed-indicator"></div>
+
+<script>
+// ─── Constants ────────────────────────────────────────────────────────────────
+const CANVAS_W        = 600;
+const CANVAS_H        = 500;
+const START_RADIUS    = 40;
+const INITIAL_SHRINK  = 0.025;   // px/ms
+const SHRINK_MULT     = 1.15;
+const SPEED_TIER_STEP = 5;       // hits between tier bumps
+const INITIAL_LIVES   = 3;
+const HIT_FLASH_MS    = 80;
+const MISS_FLASH_MS   = 200;
+const PULSE_AMP       = 4;       // px
+const PULSE_FREQ      = 2;       // Hz
+const SPAWN_MARGIN    = START_RADIUS + 10;
+
+// ─── DOM refs ─────────────────────────────────────────────────────────────────
+const canvas    = document.getElementById('gameCanvas');
+const ctx       = canvas.getContext('2d');
+const wrapper   = document.getElementById('canvas-wrapper');
+const speedEl   = document.getElementById('speed-indicator');
+
+// ─── Game State ───────────────────────────────────────────────────────────────
+// Single source of truth as specified in GDD §5
+let gs = {};
+
+function makeInitialState() {
+  return {
+    score:        0,
+    lives:        INITIAL_LIVES,
+    isPlaying:    false,
+    circleX:      CANVAS_W / 2,
+    circleY:      CANVAS_H / 2,
+    circleRadius: START_RADIUS,
+    startRadius:  START_RADIUS,
+    shrinkRate:   INITIAL_SHRINK,
+    speedTier:    0,
+    // Renderer-owned flash state
+    flashColor:   null,   // 'white' | 'red' | null
+    flashTimer:   0,
+  };
+}
+
+// ─── Game state flags ─────────────────────────────────────────────────────────
+let gameState = 'start';  // 'start' | 'playing' | 'gameover'
+let lastTime  = null;
+let rafId     = null;
+
+// ─── Spawn System ─────────────────────────────────────────────────────────────
+function randomPosition() {
+  const x = SPAWN_MARGIN + Math.random() * (CANVAS_W - 2 * SPAWN_MARGIN);
+  const y = SPAWN_MARGIN + Math.random() * (CANVAS_H - 2 * SPAWN_MARGIN);
+  return { x, y };
+}
+
+function spawnCircle() {
+  const pos = randomPosition();
+  gs.circleX      = pos.x;
+  gs.circleY      = pos.y;
+  gs.circleRadius = gs.startRadius;
+}
+
+// ─── Hit / Miss logic ─────────────────────────────────────────────────────────
+function triggerHit() {
+  gs.score += 1;
+  // Speed tier bump every SPEED_TIER_STEP hits
+  if (gs.score % SPEED_TIER_STEP === 0) {
+    gs.shrinkRate *= SHRINK_MULT;
+    gs.speedTier  += 1;
+    showSpeedBump();
+  }
+  gs.flashColor = 'white';
+  gs.flashTimer = HIT_FLASH_MS;
+  spawnCircle();
+}
+
+function triggerMiss() {
+  gs.lives -= 1;
+  gs.flashColor = 'red';
+  gs.flashTimer = MISS_FLASH_MS;
+  if (gs.lives <= 0) {
+    gs.isPlaying = false;
+    gameState    = 'gameover';
+  } else {
+    spawnCircle();
+  }
+}
+
+// ─── Speed bump UI hint ───────────────────────────────────────────────────────
+let speedTimeout = null;
+function showSpeedBump() {
+  speedEl.textContent = 'Speed ▲ Tier ' + gs.speedTier;
+  speedEl.classList.add('visible');
+  clearTimeout(speedTimeout);
+  speedTimeout = setTimeout(() => speedEl.classList.remove('visible'), 1200);
+}
+
+// ─── Border flash via CSS class ───────────────────────────────────────────────
+let borderFlashTimeout = null;
+function triggerBorderFlash(type) {
+  wrapper.classList.remove('flash-miss', 'flash-hit');
+  void wrapper.offsetWidth; // force reflow for re-trigger
+  wrapper.classList.add(type === 'red' ? 'flash-miss' : 'flash-hit');
+  clearTimeout(borderFlashTimeout);
+  const dur = type === 'red' ? MISS_FLASH_MS : HIT_FLASH_MS;
+  borderFlashTimeout = setTimeout(() => {
+    wrapper.classList.remove('flash-miss', 'flash-hit');
+  }, dur);
+}
+
+// ─── Input System ─────────────────────────────────────────────────────────────
+canvas.addEventListener('mousedown', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const clickX = e.clientX - rect.left;
+  const clickY = e.clientY - rect.top;
+  handleClick(clickX, clickY);
+});
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const rect   = canvas.getBoundingClientRect();
+  const touch  = e.changedTouches[0];
+  const clickX = touch.clientX - rect.left;
+  const clickY = touch.clientY - rect.top;
+  handleClick(clickX, clickY);
+}, { passive: false });
+
+function handleClick(clickX, clickY) {
+  if (gameState === 'start') {
+    startGame();
+    return;
+  }
+
+  if (gameState === 'gameover') {
+    restart();
+    return;
+  }
+
+  if (!gs.isPlaying) return;
+
+  // Hit detection — Euclidean distance (GDD §5)
+  const dx   = clickX - gs.circleX;
+  const dy   = clickY - gs.circleY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  if (dist <= gs.circleRadius) {
+    triggerHit();
+    triggerBorderFlash('white');
+  } else {
+    triggerMiss();
+    triggerBorderFlash('red');
+  }
+}
+
+// ─── Game lifecycle ───────────────────────────────────────────────────────────
+function startGame() {
+  gs           = makeInitialState();
+  gs.isPlaying = true;
+  gameState    = 'playing';
+  spawnCircle();
+  lastTime = null;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(gameLoop);
+}
+
+function restart() {
+  startGame();
+}
+
+// ─── Game Loop (requestAnimationFrame) ────────────────────────────────────────
+function gameLoop(timestamp) {
+  // Delta-time calculation
+  if (lastTime === null) lastTime = timestamp;
+  const dt = timestamp - lastTime;
+  lastTime  = timestamp;
+
+  // Shrink System — runs each frame
+  if (gs.isPlaying) {
+    gs.circleRadius -= gs.shrinkRate * dt;
+    if (gs.circleRadius <= 0) {
+      gs.circleRadius = 0;
+      triggerMiss();
+      triggerBorderFlash('red');
+    }
+  }
+
+  // Flash timer countdown
+  if (gs.flashTimer > 0) {
+    gs.flashTimer -= dt;
+    if (gs.flashTimer < 0) {
+      gs.flashTimer = 0;
+      gs.flashColor = null;
+    }
+  }
+
+  // Renderer
+  render(timestamp);
+
+  if (gameState !== 'gameover' || gs.flashTimer > 0) {
+    rafId = requestAnimationFrame(gameLoop);
+  } else {
+    rafId = requestAnimationFrame(gameLoop); // keep rendering game over screen
+  }
+}
+
+// ─── Renderer ─────────────────────────────────────────────────────────────────
+function render(timestamp) {
+  // Clear
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Background
+  ctx.fillStyle = '#0d0d14';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  if (gameState === 'start') {
+    renderStart(timestamp);
+    return;
+  }
+
+  if (gameState === 'playing' || (gameState === 'gameover' && gs.flashTimer > 0)) {
+    renderGame(timestamp);
+  }
+
+  if (gameState === 'gameover') {
+    renderGameOver();
+  }
+}
+
+function renderGame(timestamp) {
+  // Visual pulse — sine oscillation on rendered radius only (GDD §5)
+  const t = timestamp / 1000;
+  const renderRadius = gs.circleRadius + PULSE_AMP * Math.sin(2 * Math.PI * PULSE_FREQ * t);
+  const drawR = Math.max(0, renderRadius);
+
+  // Flash overlay (canvas-level)
+  if (gs.flashColor && gs.flashTimer > 0) {
+    const alpha = gs.flashColor === 'white' ? 0.18 : 0.12;
+    ctx.fillStyle = gs.flashColor === 'white'
+      ? `rgba(255,255,255,${alpha})`
+      : `rgba(255,50,60,${alpha})`;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  }
+
+  // Draw circle
+  if (drawR > 0) {
+    // Outer glow
+    const glow = ctx.createRadialGradient(
+      gs.circleX, gs.circleY, drawR * 0.4,
+      gs.circleX, gs.circleY, drawR * 1.6
+    );
+    glow.addColorStop(0, 'rgba(220,220,255,0.12)');
+    glow.addColorStop(1, 'rgba(220,220,255,0)');
+    ctx.beginPath();
+    ctx.arc(gs.circleX, gs.circleY, drawR * 1.6, 0, Math.PI * 2);
+    ctx.fillStyle = glow;
+    ctx.fill();
+
+    // Circle fill
+    ctx.beginPath();
+    ctx.arc(gs.circleX, gs.circleY, drawR, 0, Math.PI * 2);
+
+    // Fill fades slightly as circle shrinks (urgency cue)
+    const fillAlpha = 0.55 + 0.45 * (gs.circleRadius / gs.startRadius);
+    ctx.fillStyle = `rgba(230, 230, 255, ${fillAlpha})`;
+    ctx.fill();
+
+    // Outline
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 2;
+    ctx.stroke();
+  }
+
+  // HUD
+  renderHUD();
+}
+
+function renderHUD() {
+  // Score — top-right (GDD §6)
+  ctx.font      = '14px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(240,240,255,0.9)';
+  ctx.textAlign = 'right';
+  ctx.fillText('Score: ' + gs.score, CANVAS_W - 16, 28);
+
+  // Lives — top-left as heart icons (GDD §6)
+  const heartFull    = '♥';
+  const heartEmpty   = '♡';
+  ctx.textAlign      = 'left';
+  ctx.font           = '18px serif';
+  for (let i = 0; i < INITIAL_LIVES; i++) {
+    const isAlive = i < gs.lives;
+    ctx.fillStyle = isAlive ? '#ff4466' : 'rgba(255,68,102,0.25)';
+    ctx.fillText(isAlive ? heartFull : heartEmpty, 14 + i * 26, 30);
+  }
+
+  // Speed tier hint (subtle, bottom)
+  if (gs.speedTier > 0) {
+    ctx.textAlign   = 'center';
+    ctx.font        = '10px "Courier New", monospace';
+    ctx.fillStyle   = 'rgba(255,255,255,0.18)';
+    ctx.fillText('Tier ' + gs.speedTier, CANVAS_W / 2, CANVAS_H - 10);
+  }
+}
+
+function renderStart(timestamp) {
+  // Static circle (pre-game) with gentle pulse
+  const t = timestamp / 1000;
+  const pulseR = START_RADIUS + PULSE_AMP * Math.sin(2 * Math.PI * PULSE_FREQ * t);
+
+  // Circle
+  ctx.beginPath();
+  ctx.arc(CANVAS_W / 2, CANVAS_H / 2, pulseR, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(230,230,255,0.6)';
+  ctx.fill();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth   = 2;
+  ctx.stroke();
+
+  // "Click to Start" overlay text
+  ctx.textAlign   = 'center';
+  ctx.fillStyle   = 'rgba(240,240,255,0.85)';
+  ctx.font        = '13px "Courier New", monospace';
+
+  // Faint sub-label
+  ctx.fillStyle = 'rgba(200,200,220,0.5)';
+  ctx.font      = '11px "Courier New", monospace';
+  ctx.fillText('click to start', CANVAS_W / 2, CANVAS_H / 2 + 70);
+
+  // Lives preview
+  ctx.textAlign = 'left';
+  ctx.font      = '18px serif';
+  for (let i = 0; i < INITIAL_LIVES; i++) {
+    ctx.fillStyle = '#ff4466';
+    ctx.fillText('♥', 14 + i * 26, 30);
+  }
+  ctx.textAlign   = 'right';
+  ctx.font        = '14px "Courier New", monospace';
+  ctx.fillStyle   = 'rgba(240,240,255,0.9)';
+  ctx.fillText('Score: 0', CANVAS_W - 16, 28);
+
+  if (!rafId) rafId = requestAnimationFrame(gameLoop);
+}
+
+function renderGameOver() {
+  // Dark overlay
+  ctx.fillStyle = 'rgba(5,5,12,0.82)';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // "Game Over" heading
+  ctx.textAlign   = 'center';
+  ctx.fillStyle   = '#ffffff';
+  ctx.font        = 'bold 36px "Courier New", monospace';
+  ctx.fillText('GAME OVER', CANVAS_W / 2, CANVAS_H / 2 - 36);
+
+  // Final score
+  ctx.font      = '16px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(220,220,255,0.8)';
+  ctx.fillText('Score: ' + gs.score, CANVAS_W / 2, CANVAS_H / 2 + 4);
+
+  // Speed tier reached
+  if (gs.speedTier > 0) {
+    ctx.font      = '11px "Courier New", monospace';
+    ctx.fillStyle = 'rgba(180,180,200,0.5)';
+    ctx.fillText('reached tier ' + gs.speedTier, CANVAS_W / 2, CANVAS_H / 2 + 26);
+  }
+
+  // Restart prompt
+  ctx.font      = '11px "Courier New", monospace';
+  ctx.fillStyle = 'rgba(200,200,220,0.45)';
+  ctx.fillText('click to restart', CANVAS_W / 2, CANVAS_H / 2 + 64);
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+gs    = makeInitialState();
+rafId = requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
